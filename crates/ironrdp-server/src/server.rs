@@ -1261,12 +1261,19 @@ impl RdpServer {
                     .await?;
                 let dispatch_ms = dispatch_start.elapsed().as_millis() as u64;
 
-                if lock_wait_ms >= 50 || dispatch_ms >= 50 {
+                if lock_wait_ms >= 50 {
                     tracing::warn!(
                         pdu_len,
                         lock_wait_ms,
                         dispatch_ms,
-                        "dispatch_pdu stalled — inbound PDU delayed (this.lock contended with dispatch_events?)"
+                        "dispatch_pdu delayed acquiring this.lock — contended with outbound batch (dispatch_events/dispatch_display)"
+                    );
+                } else if dispatch_ms >= 50 {
+                    tracing::warn!(
+                        pdu_len,
+                        lock_wait_ms,
+                        dispatch_ms,
+                        "dispatch_pdu ran long after acquiring this.lock immediately — handler or runtime stall, not lock contention"
                     );
                 } else {
                     tracing::debug!(
