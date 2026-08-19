@@ -1072,14 +1072,12 @@ impl RdpServer {
                         // After CredSSP, do TLS on the same stream.
                         // Use into_inner() (not into_inner_no_leftover) to
                         // preserve any bytes the framed reader buffered.
+                        // Always wrap in PrefixedStream (empty prefix if no
+                        // leftover) to keep the type unified.
                         let (inner_stream, leftover) = framed.into_inner();
-                        let stream_for_tls = if leftover.is_empty() {
-                            inner_stream
-                        } else {
-                            PrefixedStream {
-                                prefix: std::io::Cursor::new(leftover.to_vec()),
-                                inner: inner_stream,
-                            }
+                        let stream_for_tls = PrefixedStream {
+                            prefix: std::io::Cursor::new(leftover.to_vec()),
+                            inner: inner_stream,
                         };
                         let accept = match tls_acceptor.accept(stream_for_tls).await {
                             Ok(accept) => accept,
@@ -1152,13 +1150,9 @@ impl RdpServer {
                             }
                         }
                         let (inner_stream, leftover2) = framed.into_inner();
-                        let stream_for_tls = if leftover2.is_empty() {
-                            inner_stream
-                        } else {
-                            PrefixedStream {
-                                prefix: std::io::Cursor::new(leftover2.to_vec()),
-                                inner: inner_stream,
-                            }
+                        let stream_for_tls = PrefixedStream {
+                            prefix: std::io::Cursor::new(leftover2.to_vec()),
+                            inner: inner_stream,
                         };
                         let accept = match tls_acceptor.accept(stream_for_tls).await {
                             Ok(accept) => accept,
