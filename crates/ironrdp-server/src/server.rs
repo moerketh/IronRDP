@@ -28,7 +28,7 @@ use ironrdp_rdpsnd as rdpsnd;
 use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
@@ -432,6 +432,69 @@ pub enum TransportTls {
 /// Ok(())
 ///# }
 /// ```
+
+/// A stream wrapper that prepends a fixed buffer of bytes to an underlying
+/// AsyncRead + AsyncWrite stream. Used to carry leftover bytes (e.g. a TLS
+/// ClientHello pipelined after an X.224 CR) through the TLS upgrade step
+/// without losing them.
+///
+/// Reads drain the prefix first, then delegate to the inner stream.
+/// Writes always delegate to the inner stream.
+struct PrefixedStream<S> {
+    prefix: std::io::Cursor<Vec<u8>>,
+    inner: S,
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            // Still have prefix bytes to deliver
+            let remaining = &self.prefix.get_ref()[self.prefix.position() as usize..];
+            let n = std::cmp::min(remaining.len(), buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.prefix.set_position(self.prefix.position() + n as u64);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // Prefix exhausted — delegate to inner
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> Unpin for PrefixedStream<S> {}
 
 /// Read a Preconnection Blob (PCB) from a pre-TLS raw stream.
 ///
@@ -855,7 +918,10 @@ impl RdpServer {
             }
             BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => {
                 warn!("Enhanced Session: unexpected TLS upgrade request after CredSSP (with leftover)");
-                let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
+                let stream_with_leftover = PrefixedStream {
+                    prefix: std::io::Cursor::new(leftover.to_vec()),
+                    inner: stream,
+                };
                 self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "Enhanced Session")
                     .await?;
             }
@@ -1005,7 +1071,10 @@ impl RdpServer {
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
-                    let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
+                    let stream_with_leftover = PrefixedStream {
+                        prefix: std::io::Cursor::new(leftover.to_vec()),
+                        inner: stream,
+                    };
                     let accept = match tls_acceptor.accept(stream_with_leftover).await {
                         Ok(accept) => accept,
                         Err(e) => {
@@ -1017,7 +1086,10 @@ impl RdpServer {
                         .await?;
                 }
                 TransportTls::AlreadyDone => {
-                    let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
+                    let stream_with_leftover = PrefixedStream {
+                        prefix: std::io::Cursor::new(leftover.to_vec()),
+                        inner: stream,
+                    };
                     self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "TLS-offloaded stream")
                         .await?;
                 }
