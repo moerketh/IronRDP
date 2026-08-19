@@ -1061,7 +1061,7 @@ impl RdpServer {
                             ).await;
                             match credssp_result {
                                 Ok(()) => {
-                                    info!("CredSSP completed before TLS (Enhanced Session)");
+                                    warn!("CredSSP completed before TLS (Enhanced Session)");
                                 }
                                 Err(e) => {
                                     warn!("CredSSP before TLS failed: {}", e);
@@ -1142,7 +1142,7 @@ impl RdpServer {
                                 None,
                             ).await;
                             match credssp_result {
-                                Ok(()) => info!("CredSSP completed before TLS (with leftover, Enhanced Session)"),
+                                Ok(()) => warn!("CredSSP completed before TLS (with leftover, Enhanced Session)"),
                                 Err(e) => {
                                     warn!("CredSSP before TLS failed (with leftover): {}", e);
                                     return Ok(());
