@@ -1037,41 +1037,73 @@ impl RdpServer {
             // the TLS handshake; everything past it is `finalize_after_upgrade`.
             BeginResult::ShouldUpgrade(stream) => match tls {
                 TransportTls::Managed => {
-                    // Standard RDP flow: TLS first, then CredSSP inside TLS
-                    // (for HYBRID/HYBRID_EX). This is the same ordering used
-                    // by mstsc, xfreerdp, and the vmms vsock relay.
                     let tls_acceptor = match &self.opts.security {
                         RdpServerSecurity::Tls(acceptor) => acceptor,
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
 
-                    // Debug: peek at the first bytes the TLS acceptor will see
-                    // to diagnose InvalidContentType errors.
-                    use tokio::io::AsyncReadExt;
-                    let mut debug_buf = vec![0u8; 64];
-                    let mut debug_stream = stream;
-                    let n = debug_stream.read(&mut debug_buf).await.unwrap_or(0);
-                    if n > 0 {
-                        let hex: Vec<String> = debug_buf[..n].iter().map(|b| format!("{:02x}", b)).collect();
-                        warn!("DEBUG: first {} bytes before TLS accept: {}", n, hex.join(" "));
-                    } else {
-                        warn!("DEBUG: no bytes available before TLS accept (EOF)");
-                    }
-                    // Re-wrap the stream with the bytes we just read prepended
-                    let stream_with_peek = PrefixedStream {
-                        prefix: std::io::Cursor::new(debug_buf[..n].to_vec()),
-                        inner: debug_stream,
-                    };
-                    let accept = match tls_acceptor.accept(stream_with_peek).await {
-                        Ok(accept) => accept,
-                        Err(e) => {
-                            warn!("Failed to TLS accept: {}", e);
-                            return Ok(());
+                    let selected = acceptor.reached_security_upgrade().unwrap_or(nego::SecurityProtocol::empty());
+                    if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
+                        // vmms Enhanced Session relay sends CredSSP (SPNEGO)
+                        // BEFORE TLS, directly on the raw stream.
+                        // The first bytes are an RDP Connect-Initial PDU
+                        // containing the SPNEGO NegTokenInit.
+                        let mut framed = TokioFramed::new(stream);
+                        if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
+                            let credssp_result = ironrdp_acceptor::accept_credssp(
+                                &mut framed,
+                                &mut acceptor,
+                                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                                "rdp-client".into(),
+                                pub_key.clone(),
+                                None,
+                            ).await;
+                            match credssp_result {
+                                Ok(()) => {
+                                    info!("CredSSP completed before TLS (Enhanced Session)");
+                                }
+                                Err(e) => {
+                                    warn!("CredSSP before TLS failed: {}", e);
+                                    return Ok(());
+                                }
+                            }
                         }
-                    };
-                    self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
-                        .await?;
+                        // After CredSSP, do TLS on the same stream.
+                        // Use into_inner() (not into_inner_no_leftover) to
+                        // preserve any bytes the framed reader buffered.
+                        let (inner_stream, leftover) = framed.into_inner();
+                        let stream_for_tls = if leftover.is_empty() {
+                            inner_stream
+                        } else {
+                            PrefixedStream {
+                                prefix: std::io::Cursor::new(leftover.to_vec()),
+                                inner: inner_stream,
+                            }
+                        };
+                        let accept = match tls_acceptor.accept(stream_for_tls).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept (after CredSSP): {}", e);
+                                return Ok(());
+                            }
+                        };
+                        // Skip finalize_after_upgrade's CredSSP since we did it already
+                        let mut framed = TokioFramed::new(accept);
+                        acceptor.mark_security_upgrade_as_done();
+                        let _ = self.accept_finalize(framed, acceptor).await?;
+                    } else {
+                        // Standard TLS-then-CredSSP ordering (mstsc, xfreerdp)
+                        let accept = match tls_acceptor.accept(stream).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept: {}", e);
+                                return Ok(());
+                            }
+                        };
+                        self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
+                            .await?;
+                    }
                 }
                 TransportTls::AlreadyDone => {
                     // The stream is already past TLS (terminated at a lower
@@ -1082,10 +1114,10 @@ impl RdpServer {
                 }
             },
 
-            // Handle pipelined TLS data (e.g. vmms vsock relay sends X.224 CR
-            // and TLS ClientHello back-to-back without waiting for the CC).
-            // The leftover bytes are prepended to the stream so the TLS
-            // acceptor sees the full ClientHello.
+            // Handle pipelined data after X.224 (e.g. vmms vsock relay sends
+            // X.224 CR and CredSSP SPNEGO back-to-back without waiting for CC).
+            // The leftover bytes are prepended to the stream so CredSSP/TLS
+            // sees the full data.
             BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => match tls {
                 TransportTls::Managed => {
                     let tls_acceptor = match &self.opts.security {
@@ -1093,19 +1125,66 @@ impl RdpServer {
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
-                    let stream_with_leftover = PrefixedStream {
-                        prefix: std::io::Cursor::new(leftover.to_vec()),
-                        inner: stream,
-                    };
-                    let accept = match tls_acceptor.accept(stream_with_leftover).await {
-                        Ok(accept) => accept,
-                        Err(e) => {
-                            warn!("Failed to TLS accept (with leftover): {}", e);
-                            return Ok(());
+                    let selected = acceptor.reached_security_upgrade().unwrap_or(nego::SecurityProtocol::empty());
+                    if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
+                        // CredSSP before TLS (Enhanced Session / vmms ordering)
+                        // with pipelined leftover bytes prepended to the stream.
+                        let stream_with_leftover = PrefixedStream {
+                            prefix: std::io::Cursor::new(leftover.to_vec()),
+                            inner: stream,
+                        };
+                        let mut framed = TokioFramed::new(stream_with_leftover);
+                        if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
+                            let credssp_result = ironrdp_acceptor::accept_credssp(
+                                &mut framed,
+                                &mut acceptor,
+                                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                                "rdp-client".into(),
+                                pub_key.clone(),
+                                None,
+                            ).await;
+                            match credssp_result {
+                                Ok(()) => info!("CredSSP completed before TLS (with leftover, Enhanced Session)"),
+                                Err(e) => {
+                                    warn!("CredSSP before TLS failed (with leftover): {}", e);
+                                    return Ok(());
+                                }
+                            }
                         }
-                    };
-                    self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
-                        .await?;
+                        let (inner_stream, leftover2) = framed.into_inner();
+                        let stream_for_tls = if leftover2.is_empty() {
+                            inner_stream
+                        } else {
+                            PrefixedStream {
+                                prefix: std::io::Cursor::new(leftover2.to_vec()),
+                                inner: inner_stream,
+                            }
+                        };
+                        let accept = match tls_acceptor.accept(stream_for_tls).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept (after CredSSP, with leftover): {}", e);
+                                return Ok(());
+                            }
+                        };
+                        let mut framed = TokioFramed::new(accept);
+                        acceptor.mark_security_upgrade_as_done();
+                        let _ = self.accept_finalize(framed, acceptor).await?;
+                    } else {
+                        let stream_with_leftover = PrefixedStream {
+                            prefix: std::io::Cursor::new(leftover.to_vec()),
+                            inner: stream,
+                        };
+                        let accept = match tls_acceptor.accept(stream_with_leftover).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept (with leftover): {}", e);
+                                return Ok(());
+                            }
+                        };
+                        self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
+                            .await?;
+                    }
                 }
                 TransportTls::AlreadyDone => {
                     let stream_with_leftover = PrefixedStream {
