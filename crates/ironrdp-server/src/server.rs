@@ -433,34 +433,45 @@ pub enum TransportTls {
 ///# }
 /// ```
 
-/// Read a Preconnection Blob (PCB) from a pre-TLS stream.
+/// Read a Preconnection Blob (PCB) from a pre-TLS raw stream.
 ///
 /// The PCB is sent by the Hyper-V client (vmconnect.exe) before TLS,
 /// as the very first bytes on the connection. Returns `None` if the read
 /// fails or the data doesn't parse as a PCB.
-async fn read_preconnection_blob<S>(framed: &mut TokioFramed<S>) -> Option<PreconnectionBlob>
+///
+/// Uses `tokio::io::AsyncReadExt::read_exact` directly on the raw stream
+/// (before wrapping in `TokioFramed`) because `TokioFramed::read_exact` is
+/// `pub(crate)` and not accessible from this crate.
+async fn read_preconnection_blob_from_stream<S>(stream: &mut S) -> Option<PreconnectionBlob>
 where
-    S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    S: AsyncRead + Unpin,
 {
     use ironrdp_core::Decode;
+    use tokio::io::AsyncReadExt;
 
     // The PCB starts with a 4-byte LE length field (total PDU size).
-    let len_bytes = framed.read_exact(4).await.ok()?;
-    let pcb_len = u32::from_le_bytes(len_bytes[..4].try_into().unwrap_or([0; 4])) as usize;
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes).await.ok()?;
+    let pcb_len = u32::from_le_bytes(len_bytes) as usize;
     if pcb_len < 8 || pcb_len > 1024 {
         return None;
     }
 
     // Read the rest of the PCB (total size minus the 4-byte length field).
-    let rest = framed.read_exact(pcb_len - 4).await.ok()?;
+    let mut rest = vec![0u8; pcb_len - 4];
+    stream.read_exact(&mut rest).await.ok()?;
+
     let mut pcb_buf = Vec::with_capacity(pcb_len);
-    pcb_buf.extend_from_slice(&len_bytes[..4]);
+    pcb_buf.extend_from_slice(&len_bytes);
     pcb_buf.extend_from_slice(&rest);
 
     ironrdp_core::decode::<PreconnectionBlob>(&pcb_buf).ok()
 }
 
 pub struct RdpServer {
+    opts: RdpServerOptions,
+    // FIXME: replace with a channel and poll/process the handler?
+    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
@@ -772,10 +783,11 @@ impl RdpServer {
     {
         self.display_suppressed.store(false, Ordering::Relaxed);
 
-        let mut framed = TokioFramed::new(stream);
-
-        // Step 1: Read the Preconnection Blob (PCB V2) from the pre-TLS stream.
-        let pcb = read_preconnection_blob(&mut framed).await;
+        // Step 1: Read the Preconnection Blob (PCB V2) from the pre-TLS raw stream.
+        // We read the PCB directly from the raw stream before wrapping in TokioFramed,
+        // because TokioFramed::read_exact is pub(crate) and not accessible here.
+        let mut stream = stream;
+        let pcb = read_preconnection_blob_from_stream(&mut stream).await;
         if let Some(ref pcb) = pcb {
             debug!(?pcb, "Received Preconnection Blob");
         } else {
@@ -792,8 +804,7 @@ impl RdpServer {
             }
         };
 
-        let raw_stream = framed.into_inner_no_leftover();
-        let tls_stream = match tls_acceptor.accept(raw_stream).await {
+        let tls_stream = match tls_acceptor.accept(stream).await {
             Ok(accept) => accept,
             Err(e) => {
                 warn!("Enhanced Session TLS accept failed: {}", e);
