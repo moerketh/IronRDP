@@ -132,6 +132,48 @@ impl Acceptor {
         }
     }
 
+    /// Create an acceptor pre-positioned for Hyper-V Enhanced Session.
+    ///
+    /// In Enhanced Session mode, the handshake is: PCB → TLS → CredSSP → X.224.
+    /// This means CredSSP runs **before** the X.224 negotiation, unlike the
+    /// standard flow where X.224 comes first and CredSSP is conditional.
+    ///
+    /// This constructor creates the acceptor in [`AcceptorState::Credssp`]
+    /// state with the HYBRID protocol, so the caller can run `accept_credssp`
+    /// first, then `accept_begin` for the X.224 exchange.
+    ///
+    /// The X.224 Connection Confirm sent by this acceptor will advertise
+    /// only HYBRID (not HYBRID_EX), matching the client's expectation
+    /// per MS-RDPEPS.
+    pub fn new_for_enhanced_session(
+        desktop_size: DesktopSize,
+        capabilities: Vec<CapabilitySet>,
+        creds: Option<Credentials>,
+    ) -> Self {
+        // Force HYBRID security — Enhanced Session always uses CredSSP.
+        let security = SecurityProtocol::HYBRID;
+        Self {
+            security,
+            // Start in Credssp state — CredSSP runs before X.224.
+            state: AcceptorState::Credssp {
+                requested_protocol: security,
+                protocol: security,
+            },
+            user_channel_id: USER_CHANNEL_ID,
+            io_channel_id: IO_CHANNEL_ID,
+            message_channel_id: None,
+            desktop_size,
+            keyboard_layout: 0,
+            server_capabilities: capabilities,
+            static_channels: StaticChannelSet::new(),
+            saved_for_reactivation: Default::default(),
+            creds,
+            received_credentials: None,
+            reactivation: false,
+            honor_client_desktop_size: false,
+        }
+    }
+
     /// Adopt the desktop size requested by the client in its Client Core Data
     /// instead of the size this acceptor was constructed with.
     ///

@@ -17,6 +17,7 @@ use ironrdp_dvc as dvc;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use ironrdp_pdu::pcb::PreconnectionBlob;
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
@@ -431,10 +432,35 @@ pub enum TransportTls {
 /// Ok(())
 ///# }
 /// ```
+
+/// Read a Preconnection Blob (PCB) from a pre-TLS stream.
+///
+/// The PCB is sent by the Hyper-V client (vmconnect.exe) before TLS,
+/// as the very first bytes on the connection. Returns `None` if the read
+/// fails or the data doesn't parse as a PCB.
+async fn read_preconnection_blob<S>(framed: &mut TokioFramed<S>) -> Option<PreconnectionBlob>
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+{
+    use ironrdp_core::Decode;
+
+    // The PCB starts with a 4-byte LE length field (total PDU size).
+    let len_bytes = framed.read_exact(4).await.ok()?;
+    let pcb_len = u32::from_le_bytes(len_bytes[..4].try_into().unwrap_or([0; 4])) as usize;
+    if pcb_len < 8 || pcb_len > 1024 {
+        return None;
+    }
+
+    // Read the rest of the PCB (total size minus the 4-byte length field).
+    let rest = framed.read_exact(pcb_len - 4).await.ok()?;
+    let mut pcb_buf = Vec::with_capacity(pcb_len);
+    pcb_buf.extend_from_slice(&len_bytes[..4]);
+    pcb_buf.extend_from_slice(&rest);
+
+    ironrdp_core::decode::<PreconnectionBlob>(&pcb_buf).ok()
+}
+
 pub struct RdpServer {
-    opts: RdpServerOptions,
-    // FIXME: replace with a channel and poll/process the handler?
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
@@ -721,6 +747,107 @@ impl RdpServer {
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
         self.run_connection_with(stream, TransportTls::Managed).await
+    }
+
+    /// Run a single RDP connection in Hyper-V Enhanced Session mode.
+    ///
+    /// Enhanced Session handshake: **PCB → TLS → CredSSP → X.224 → RDP**.
+    ///
+    /// Unlike [`run_connection`](Self::run_connection) where X.224 comes first
+    /// and CredSSP is conditional, Enhanced Session always performs CredSSP
+    /// **before** X.224, and the X.224 negotiation advertises only HYBRID.
+    ///
+    /// Steps:
+    /// 1. Read the Preconnection Blob (PCB V2) from the pre-TLS stream
+    /// 2. Perform TLS accept
+    /// 3. Perform CredSSP (host authentication)
+    /// 4. Perform X.224 negotiation (HYBRID only)
+    /// 5. Finalize the RDP connection
+    ///
+    /// The PCB contains the VM ID and EnhancedMode flag. It is read but not
+    /// validated — the caller (lamco) can inspect the returned PCB if needed.
+    pub async fn run_connection_enhanced<S>(&mut self, stream: S) -> Result<Option<PreconnectionBlob>>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
+        self.display_suppressed.store(false, Ordering::Relaxed);
+
+        let mut framed = TokioFramed::new(stream);
+
+        // Step 1: Read the Preconnection Blob (PCB V2) from the pre-TLS stream.
+        let pcb = read_preconnection_blob(&mut framed).await;
+        if let Some(ref pcb) = pcb {
+            debug!(?pcb, "Received Preconnection Blob");
+        } else {
+            debug!("No Preconnection Blob received (or failed to parse)");
+        }
+
+        // Step 2: TLS accept.
+        let tls_acceptor = match &self.opts.security {
+            RdpServerSecurity::Tls(acceptor) => acceptor.clone(),
+            RdpServerSecurity::Hybrid((acceptor, _)) => acceptor.clone(),
+            RdpServerSecurity::None => {
+                warn!("Enhanced Session requires TLS security, but server is configured with None");
+                return Ok(None);
+            }
+        };
+
+        let raw_stream = framed.into_inner_no_leftover();
+        let tls_stream = match tls_acceptor.accept(raw_stream).await {
+            Ok(accept) => accept,
+            Err(e) => {
+                warn!("Enhanced Session TLS accept failed: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut framed = TokioFramed::new(tls_stream);
+
+        // Step 3: Create acceptor pre-positioned for Enhanced Session
+        // (starts in Credssp state — CredSSP runs before X.224).
+        let size = self.display.lock().await.size().await;
+        let capabilities = capabilities::capabilities(&self.opts, size);
+        let mut acceptor = Acceptor::new_for_enhanced_session(size, capabilities, self.creds.clone());
+        acceptor.set_honor_client_desktop_size(self.opts.honor_client_desktop_size);
+        self.attach_channels(&mut acceptor);
+
+        // Step 4: Perform CredSSP (before X.224).
+        if acceptor.should_perform_credssp() {
+            let pub_key = match &self.opts.security {
+                RdpServerSecurity::Hybrid((_, pub_key)) => pub_key.clone(),
+                _ => Vec::new(),
+            };
+            ironrdp_acceptor::accept_credssp(
+                &mut framed,
+                &mut acceptor,
+                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                "enhanced-session".into(),
+                pub_key,
+                None,
+            )
+            .await
+            .context("Enhanced Session CredSSP failed")?;
+        }
+
+        // Step 5: X.224 negotiation (accept_begin reads the X.224 request).
+        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
+            .await
+            .context("Enhanced Session accept_begin failed")?;
+
+        match res {
+            BeginResult::ShouldUpgrade(stream) => {
+                // TLS is already done — this shouldn't happen in Enhanced Session
+                // since we did TLS before CredSSP. But handle it gracefully.
+                warn!("Enhanced Session: unexpected TLS upgrade request after CredSSP");
+                self.finalize_after_upgrade(TokioFramed::new(stream), acceptor, "Enhanced Session")
+                    .await?;
+            }
+            BeginResult::Continue(framed) => {
+                self.accept_finalize(framed, acceptor).await?;
+            }
+        }
+
+        Ok(pcb)
     }
 
     /// Run a single RDP connection over `stream`, choosing who performs the TLS
