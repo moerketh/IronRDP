@@ -853,6 +853,12 @@ impl RdpServer {
                 self.finalize_after_upgrade(TokioFramed::new(stream), acceptor, "Enhanced Session")
                     .await?;
             }
+            BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => {
+                warn!("Enhanced Session: unexpected TLS upgrade request after CredSSP (with leftover)");
+                let stream_with_leftover = tokio::io::chain(leftover, stream);
+                self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "Enhanced Session")
+                    .await?;
+            }
             BeginResult::Continue(framed) => {
                 self.accept_finalize(framed, acceptor).await?;
             }
@@ -984,6 +990,35 @@ impl RdpServer {
                     // layer, e.g. a WSS terminator); do NOT call
                     // tls_acceptor.accept on it.
                     self.finalize_after_upgrade(TokioFramed::new(stream), acceptor, "TLS-offloaded stream")
+                        .await?;
+                }
+            },
+
+            // Handle pipelined TLS data (e.g. vmms vsock relay sends X.224 CR
+            // and TLS ClientHello back-to-back without waiting for the CC).
+            // The leftover bytes are prepended to the stream so the TLS
+            // acceptor sees the full ClientHello.
+            BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => match tls {
+                TransportTls::Managed => {
+                    let tls_acceptor = match &self.opts.security {
+                        RdpServerSecurity::Tls(acceptor) => acceptor,
+                        RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                        RdpServerSecurity::None => unreachable!(),
+                    };
+                    let stream_with_leftover = tokio::io::chain(leftover, stream);
+                    let accept = match tls_acceptor.accept(stream_with_leftover).await {
+                        Ok(accept) => accept,
+                        Err(e) => {
+                            warn!("Failed to TLS accept (with leftover): {}", e);
+                            return Ok(());
+                        }
+                    };
+                    self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
+                        .await?;
+                }
+                TransportTls::AlreadyDone => {
+                    let stream_with_leftover = tokio::io::chain(leftover, stream);
+                    self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "TLS-offloaded stream")
                         .await?;
                 }
             },

@@ -27,6 +27,10 @@ where
     S: StreamWrapper,
 {
     ShouldUpgrade(S::InnerStream),
+    /// Like `ShouldUpgrade` but also carries leftover bytes that were read
+    /// from the stream but not consumed by the acceptor (e.g. a TLS
+    /// ClientHello pipelined after the X.224 Connection Request).
+    ShouldUpgradeWithLeftover(S::InnerStream, ironrdp_async::bytes::BytesMut),
     Continue(Framed<S>),
 }
 
@@ -41,7 +45,12 @@ where
             let result = if security.is_empty() {
                 BeginResult::Continue(framed)
             } else {
-                BeginResult::ShouldUpgrade(framed.into_inner_no_leftover())
+                let (stream, leftover) = framed.into_inner();
+                if leftover.is_empty() {
+                    BeginResult::ShouldUpgrade(stream)
+                } else {
+                    BeginResult::ShouldUpgradeWithLeftover(stream, leftover)
+                }
             };
 
             return Ok(result);
