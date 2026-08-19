@@ -1037,20 +1037,60 @@ impl RdpServer {
             // the TLS handshake; everything past it is `finalize_after_upgrade`.
             BeginResult::ShouldUpgrade(stream) => match tls {
                 TransportTls::Managed => {
-                    let tls_acceptor = match &self.opts.security {
-                        RdpServerSecurity::Tls(acceptor) => acceptor,
-                        RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
-                        RdpServerSecurity::None => unreachable!(),
-                    };
-                    let accept = match tls_acceptor.accept(stream).await {
-                        Ok(accept) => accept,
-                        Err(e) => {
-                            warn!("Failed to TLS accept: {}", e);
-                            return Ok(());
+                    // For HYBRID/HYBRID_EX, the vmms vsock relay expects
+                    // CredSSP BEFORE TLS (the Enhanced Session ordering).
+                    // Standard TCP clients (mstsc) do TLS first, then
+                    // CredSSP inside TLS. We check the selected protocol:
+                    // if it includes HYBRID_EX or HYBRID, do CredSSP first.
+                    let selected = acceptor.reached_security_upgrade().unwrap_or_default();
+                    if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
+                        // CredSSP before TLS (Enhanced Session / vmms ordering)
+                        let mut framed = TokioFramed::new(stream);
+                        if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
+                            ironrdp_acceptor::accept_credssp(
+                                &mut framed,
+                                &mut acceptor,
+                                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                                "rdp-client".into(),
+                                pub_key.clone(),
+                                None,
+                            )
+                            .await?;
                         }
-                    };
-                    self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
-                        .await?;
+                        let stream = framed.into_inner_no_leftover();
+                        let tls_acceptor = match &self.opts.security {
+                            RdpServerSecurity::Tls(acceptor) => acceptor,
+                            RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                            RdpServerSecurity::None => unreachable!(),
+                        };
+                        let accept = match tls_acceptor.accept(stream).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept (post-CredSSP): {}", e);
+                                return Ok(());
+                            }
+                        };
+                        // Skip finalize_after_upgrade's CredSSP since we already did it
+                        let mut framed = TokioFramed::new(accept);
+                        acceptor.mark_security_upgrade_as_done();
+                        let _ = self.accept_finalize(framed, acceptor).await?;
+                    } else {
+                        // Standard TLS-then-CredSSP ordering (mstsc, xfreerdp)
+                        let tls_acceptor = match &self.opts.security {
+                            RdpServerSecurity::Tls(acceptor) => acceptor,
+                            RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                            RdpServerSecurity::None => unreachable!(),
+                        };
+                        let accept = match tls_acceptor.accept(stream).await {
+                            Ok(accept) => accept,
+                            Err(e) => {
+                                warn!("Failed to TLS accept: {}", e);
+                                return Ok(());
+                            }
+                        };
+                        self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
+                            .await?;
+                    }
                 }
                 TransportTls::AlreadyDone => {
                     // The stream is already past TLS (terminated at a lower
