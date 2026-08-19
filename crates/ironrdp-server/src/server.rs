@@ -28,7 +28,7 @@ use ironrdp_rdpsnd as rdpsnd;
 use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
@@ -855,7 +855,7 @@ impl RdpServer {
             }
             BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => {
                 warn!("Enhanced Session: unexpected TLS upgrade request after CredSSP (with leftover)");
-                let stream_with_leftover = tokio::io::chain(leftover, stream);
+                let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
                 self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "Enhanced Session")
                     .await?;
             }
@@ -1005,7 +1005,7 @@ impl RdpServer {
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
-                    let stream_with_leftover = tokio::io::chain(leftover, stream);
+                    let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
                     let accept = match tls_acceptor.accept(stream_with_leftover).await {
                         Ok(accept) => accept,
                         Err(e) => {
@@ -1017,7 +1017,7 @@ impl RdpServer {
                         .await?;
                 }
                 TransportTls::AlreadyDone => {
-                    let stream_with_leftover = tokio::io::chain(leftover, stream);
+                    let stream_with_leftover = std::io::Cursor::new(leftover).chain(stream);
                     self.finalize_after_upgrade(TokioFramed::new(stream_with_leftover), acceptor, "TLS-offloaded stream")
                         .await?;
                 }
