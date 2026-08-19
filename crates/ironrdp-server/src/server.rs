@@ -1042,7 +1042,7 @@ impl RdpServer {
                     // Standard TCP clients (mstsc) do TLS first, then
                     // CredSSP inside TLS. We check the selected protocol:
                     // if it includes HYBRID_EX or HYBRID, do CredSSP first.
-                    let selected = acceptor.reached_security_upgrade().unwrap_or_default();
+                    let selected = acceptor.reached_security_upgrade().unwrap_or(nego::SecurityProtocol::empty());
                     if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
                         // CredSSP before TLS (Enhanced Session / vmms ordering)
                         let mut framed = TokioFramed::new(stream);
