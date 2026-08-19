@@ -1045,7 +1045,25 @@ impl RdpServer {
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
-                    let accept = match tls_acceptor.accept(stream).await {
+
+                    // Debug: peek at the first bytes the TLS acceptor will see
+                    // to diagnose InvalidContentType errors.
+                    use tokio::io::AsyncReadExt;
+                    let mut debug_buf = vec![0u8; 64];
+                    let mut debug_stream = stream;
+                    let n = debug_stream.read(&mut debug_buf).await.unwrap_or(0);
+                    if n > 0 {
+                        let hex: Vec<String> = debug_buf[..n].iter().map(|b| format!("{:02x}", b)).collect();
+                        warn!("DEBUG: first {} bytes before TLS accept: {}", n, hex.join(" "));
+                    } else {
+                        warn!("DEBUG: no bytes available before TLS accept (EOF)");
+                    }
+                    // Re-wrap the stream with the bytes we just read prepended
+                    let stream_with_peek = PrefixedStream {
+                        prefix: std::io::Cursor::new(debug_buf[..n].to_vec()),
+                        inner: debug_stream,
+                    };
+                    let accept = match tls_acceptor.accept(stream_with_peek).await {
                         Ok(accept) => accept,
                         Err(e) => {
                             warn!("Failed to TLS accept: {}", e);
