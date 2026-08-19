@@ -456,10 +456,11 @@ where
     ) -> std::task::Poll<std::io::Result<()>> {
         if self.prefix.position() < self.prefix.get_ref().len() as u64 {
             // Still have prefix bytes to deliver
-            let remaining = &self.prefix.get_ref()[self.prefix.position() as usize..];
+            let pos = self.prefix.position() as usize;
+            let remaining = &self.prefix.get_ref()[pos..];
             let n = std::cmp::min(remaining.len(), buf.remaining());
             buf.put_slice(&remaining[..n]);
-            self.prefix.set_position(self.prefix.position() + n as u64);
+            self.prefix.set_position(pos as u64 + n as u64);
             return std::task::Poll::Ready(Ok(()));
         }
         // Prefix exhausted — delegate to inner
