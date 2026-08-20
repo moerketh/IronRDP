@@ -1045,59 +1045,59 @@ impl RdpServer {
 
                     let selected = acceptor.reached_security_upgrade().unwrap_or(nego::SecurityProtocol::empty());
                     if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
-                        // vmms Enhanced Session relay sends CredSSP (SPNEGO)
-                        // BEFORE TLS, directly on the raw stream.
-                        // The first bytes are an RDP Connect-Initial PDU
-                        // containing the SPNEGO NegTokenInit.
-                        let mut framed = TokioFramed::new(stream);
-                        // Transition the acceptor from SecurityUpgrade to
-                        // Credssp state so that accept_credssp actually
-                        // performs the CredSSP exchange. Without this,
-                        // should_perform_credssp() returns false and
-                        // accept_credssp returns Ok(()) without reading
-                        // any data, leaving SPNEGO bytes in the stream.
-                        acceptor.mark_security_upgrade_as_done();
-                        if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
-                            let credssp_result = ironrdp_acceptor::accept_credssp(
-                                &mut framed,
-                                &mut acceptor,
-                                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                                "rdp-client".into(),
-                                pub_key.clone(),
-                                None,
-                            ).await;
-                            match credssp_result {
-                                Ok(()) => {
-                                    warn!("CredSSP completed before TLS (Enhanced Session)");
-                                }
+                        // Peek at the first bytes to determine if this is a
+                        // vmms Enhanced Session relay (security handled by
+                        // host) or a standard client (needs TLS + CredSSP).
+                        //
+                        // vmms sends MCS Connect-Initial directly after X.224
+                        // (bytes start with 0x03 0x00 = T.125 header), NOT a
+                        // TLS ClientHello (which starts with 0x16 0x03).
+                        // This matches xrdp's vmconnect behavior: "Security
+                        // handled by host: do nothing."
+                        use tokio::io::AsyncReadExt;
+                        let mut peek_buf = vec![0u8; 2];
+                        let mut peek_stream = stream;
+                        let n = peek_stream.read(&mut peek_buf).await.unwrap_or(0);
+
+                        let is_vmms_relay = n >= 2 && peek_buf[0] == 0x03 && peek_buf[1] == 0x00;
+
+                        if is_vmms_relay {
+                            // vmms Enhanced Session: security (NLA/CredSSP/TLS)
+                            // was already handled by the Hyper-V host. The
+                            // guest receives the already-decrypted RDP stream.
+                            // Skip TLS and CredSSP; go straight to RDP finalization.
+                            warn!("vmms Enhanced Session relay detected (MCS Connect-Initial), skipping TLS/CredSSP");
+                            let stream_with_peek = PrefixedStream {
+                                prefix: std::io::Cursor::new(peek_buf[..n].to_vec()),
+                                inner: peek_stream,
+                            };
+                            acceptor.mark_security_upgrade_as_done();
+                            // For HYBRID_EX, we need to also skip the CredSSP
+                            // state. mark_security_upgrade_as_done() transitions
+                            // SecurityUpgrade -> Credssp. We need to also
+                            // transition Credssp -> BasicSettingsWaitInitial.
+                            if acceptor.should_perform_credssp() {
+                                acceptor.mark_credssp_as_done();
+                            }
+                            self.accept_finalize(TokioFramed::new(stream_with_peek), acceptor)
+                                .await?;
+                        } else {
+                            // Standard client (mstsc, xfreerdp): do TLS, then
+                            // CredSSP inside TLS via finalize_after_upgrade.
+                            let stream_with_peek = PrefixedStream {
+                                prefix: std::io::Cursor::new(peek_buf[..n].to_vec()),
+                                inner: peek_stream,
+                            };
+                            let accept = match tls_acceptor.accept(stream_with_peek).await {
+                                Ok(accept) => accept,
                                 Err(e) => {
-                                    warn!("CredSSP before TLS failed: {}", e);
+                                    warn!("Failed to TLS accept: {}", e);
                                     return Ok(());
                                 }
-                            }
+                            };
+                            self.finalize_after_upgrade(TokioFramed::new(accept), acceptor, "TLS connection")
+                                .await?;
                         }
-                        // After CredSSP, do TLS on the same stream.
-                        // Use into_inner() (not into_inner_no_leftover) to
-                        // preserve any bytes the framed reader buffered.
-                        // Always wrap in PrefixedStream (empty prefix if no
-                        // leftover) to keep the type unified.
-                        let (inner_stream, leftover) = framed.into_inner();
-                        let stream_for_tls = PrefixedStream {
-                            prefix: std::io::Cursor::new(leftover.to_vec()),
-                            inner: inner_stream,
-                        };
-                        let accept = match tls_acceptor.accept(stream_for_tls).await {
-                            Ok(accept) => accept,
-                            Err(e) => {
-                                warn!("Failed to TLS accept (after CredSSP): {}", e);
-                                return Ok(());
-                            }
-                        };
-                        // Skip finalize_after_upgrade's CredSSP since we
-                        // did it already. mark_security_upgrade_as_done()
-                        // was called before CredSSP above.
-                        let mut framed = TokioFramed::new(accept);
-                        let _ = self.accept_finalize(framed, acceptor).await?;
                     } else {
                         // Standard TLS-then-CredSSP ordering (mstsc, xfreerdp)
                         let accept = match tls_acceptor.accept(stream).await {
@@ -1120,10 +1120,11 @@ impl RdpServer {
                 }
             },
 
-            // Handle pipelined data after X.224 (e.g. vmms vsock relay sends
-            // X.224 CR and CredSSP SPNEGO back-to-back without waiting for CC).
-            // The leftover bytes are prepended to the stream so CredSSP/TLS
-            // sees the full data.
+            // Handle pipelined data after X.224 (e.g. vmms vsock relay
+            // sends X.224 CR and MCS Connect-Initial back-to-back).
+            // The leftover bytes tell us whether this is a vmms relay
+            // (MCS Connect-Initial, 0x03 0x00) or a standard client
+            // (TLS ClientHello, 0x16 0x03).
             BeginResult::ShouldUpgradeWithLeftover(stream, leftover) => match tls {
                 TransportTls::Managed => {
                     let tls_acceptor = match &self.opts.security {
@@ -1132,50 +1133,27 @@ impl RdpServer {
                         RdpServerSecurity::None => unreachable!(),
                     };
                     let selected = acceptor.reached_security_upgrade().unwrap_or(nego::SecurityProtocol::empty());
-                    if selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
-                        // CredSSP before TLS (Enhanced Session / vmms ordering)
-                        // with pipelined leftover bytes prepended to the stream.
+
+                    // Check if leftover starts with MCS Connect-Initial (0x03 0x00)
+                    // = vmms Enhanced Session relay (security handled by host).
+                    let is_vmms_relay = leftover.len() >= 2
+                        && leftover[0] == 0x03
+                        && leftover[1] == 0x00;
+
+                    if is_vmms_relay && selected.intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX) {
+                        // vmms Enhanced Session: skip TLS and CredSSP.
+                        // Security was already handled by the Hyper-V host.
+                        warn!("vmms Enhanced Session relay detected (with leftover), skipping TLS/CredSSP");
                         let stream_with_leftover = PrefixedStream {
                             prefix: std::io::Cursor::new(leftover.to_vec()),
                             inner: stream,
                         };
-                        let mut framed = TokioFramed::new(stream_with_leftover);
-                        // Transition from SecurityUpgrade to Credssp state
-                        // so accept_credssp actually performs the exchange.
                         acceptor.mark_security_upgrade_as_done();
-                        if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
-                            let credssp_result = ironrdp_acceptor::accept_credssp(
-                                &mut framed,
-                                &mut acceptor,
-                                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                                "rdp-client".into(),
-                                pub_key.clone(),
-                                None,
-                            ).await;
-                            match credssp_result {
-                                Ok(()) => warn!("CredSSP completed before TLS (with leftover, Enhanced Session)"),
-                                Err(e) => {
-                                    warn!("CredSSP before TLS failed (with leftover): {}", e);
-                                    return Ok(());
-                                }
-                            }
+                        if acceptor.should_perform_credssp() {
+                            acceptor.mark_credssp_as_done();
                         }
-                        let (inner_stream, leftover2) = framed.into_inner();
-                        let stream_for_tls = PrefixedStream {
-                            prefix: std::io::Cursor::new(leftover2.to_vec()),
-                            inner: inner_stream,
-                        };
-                        let accept = match tls_acceptor.accept(stream_for_tls).await {
-                            Ok(accept) => accept,
-                            Err(e) => {
-                                warn!("Failed to TLS accept (after CredSSP, with leftover): {}", e);
-                                return Ok(());
-                            }
-                        };
-                        // mark_security_upgrade_as_done() was called
-                        // before CredSSP above.
-                        let mut framed = TokioFramed::new(accept);
-                        let _ = self.accept_finalize(framed, acceptor).await?;
+                        self.accept_finalize(TokioFramed::new(stream_with_leftover), acceptor)
+                            .await?;
                     } else {
                         let stream_with_leftover = PrefixedStream {
                             prefix: std::io::Cursor::new(leftover.to_vec()),
