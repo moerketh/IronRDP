@@ -1050,6 +1050,13 @@ impl RdpServer {
                         // The first bytes are an RDP Connect-Initial PDU
                         // containing the SPNEGO NegTokenInit.
                         let mut framed = TokioFramed::new(stream);
+                        // Transition the acceptor from SecurityUpgrade to
+                        // Credssp state so that accept_credssp actually
+                        // performs the CredSSP exchange. Without this,
+                        // should_perform_credssp() returns false and
+                        // accept_credssp returns Ok(()) without reading
+                        // any data, leaving SPNEGO bytes in the stream.
+                        acceptor.mark_security_upgrade_as_done();
                         if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
                             let credssp_result = ironrdp_acceptor::accept_credssp(
                                 &mut framed,
@@ -1086,9 +1093,10 @@ impl RdpServer {
                                 return Ok(());
                             }
                         };
-                        // Skip finalize_after_upgrade's CredSSP since we did it already
+                        // Skip finalize_after_upgrade's CredSSP since we
+                        // did it already. mark_security_upgrade_as_done()
+                        // was called before CredSSP above.
                         let mut framed = TokioFramed::new(accept);
-                        acceptor.mark_security_upgrade_as_done();
                         let _ = self.accept_finalize(framed, acceptor).await?;
                     } else {
                         // Standard TLS-then-CredSSP ordering (mstsc, xfreerdp)
@@ -1132,6 +1140,9 @@ impl RdpServer {
                             inner: stream,
                         };
                         let mut framed = TokioFramed::new(stream_with_leftover);
+                        // Transition from SecurityUpgrade to Credssp state
+                        // so accept_credssp actually performs the exchange.
+                        acceptor.mark_security_upgrade_as_done();
                         if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
                             let credssp_result = ironrdp_acceptor::accept_credssp(
                                 &mut framed,
@@ -1161,8 +1172,9 @@ impl RdpServer {
                                 return Ok(());
                             }
                         };
+                        // mark_security_upgrade_as_done() was called
+                        // before CredSSP above.
                         let mut framed = TokioFramed::new(accept);
-                        acceptor.mark_security_upgrade_as_done();
                         let _ = self.accept_finalize(framed, acceptor).await?;
                     } else {
                         let stream_with_leftover = PrefixedStream {
