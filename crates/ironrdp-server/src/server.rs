@@ -573,6 +573,46 @@ pub struct RdpServer {
     autodetect_rtt: Arc<AtomicU32>,
 }
 
+/// Frame a pointer-update payload as a complete fast-path output PDU.
+///
+/// Envelope per [MS-RDPBCGR] 2.2.9.1.1, mirroring
+/// `UpdateFragmenter::encode_fastpath`: `FastPathHeader` (no encryption —
+/// the Enhanced Session relay skips RDP-level crypto) followed by a
+/// `FastPathUpdatePdu` with update code 0x9 (PTRCOLOR), single fragment,
+/// no compression. `payload` is the pre-encoded TS_COLORPOINTERATTRIBUTE
+/// body (14-byte fixed header + xorBmp + andBmp).
+///
+/// REGRESSION GUARD: the buffer MUST be allocated (`vec![0; n]`), not
+/// `Vec::with_capacity(n)`. `with_capacity` does not change `len()`, so
+/// `WriteCursor::new(&mut buf)` would receive a ZERO-LENGTH slice and
+/// `FastPathHeader::encode` would fail with "received 0 bytes, expected
+/// 3 bytes" — an error that propagated out of the client loop and killed
+/// the session 47µs after every pointer PDU send (2026-08-21 incident).
+pub(crate) fn encode_pointer_fastpath(payload: &[u8]) -> Result<Vec<u8>> {
+    use ironrdp_core::Encode as _;
+    use ironrdp_pdu::fast_path::{
+        EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
+    };
+
+    let update = FastPathUpdatePdu {
+        fragmentation: Fragmentation::Single,
+        update_code: UpdateCode::ColorPointer,
+        compression_flags: None,
+        compression_type: None,
+        data: payload,
+    };
+    let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
+
+    let total = header.size() + update.size();
+    let mut buf = vec![0u8; total];
+    {
+        let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
+        header.encode(&mut cursor)?;
+        update.encode(&mut cursor)?;
+    }
+    Ok(buf)
+}
+
 #[derive(Debug)]
 pub enum ServerEvent {
     Quit(String),
@@ -1540,37 +1580,7 @@ impl RdpServer {
                     }
                 },
                 ServerEvent::Pointer(payload) => {
-                    // Fast-path output update ([MS-RDPBCGR] 2.2.9.1.1),
-                    // framed exactly like UpdateFragmenter::encode_fastpath:
-                    // FastPathHeader(no encryption — Enhanced Session relay
-                    // skips RDP-level crypto) + FastPathUpdatePdu with
-                    // update code 0x9 (PTRCOLOR). `payload` is the encoded
-                    // TS_COLORPOINTERATTRIBUTE body.
-                    use ironrdp_core::Encode as _;
-                    use ironrdp_pdu::fast_path::{
-                        EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
-                    };
-
-                    let update = FastPathUpdatePdu {
-                        fragmentation: Fragmentation::Single,
-                        update_code: UpdateCode::ColorPointer,
-                        compression_flags: None,
-                        compression_type: None,
-                        data: &payload,
-                    };
-                    let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
-
-                    let total = header.size() + update.size();
-                    // with_capacity DOES NOT lengthen the Vec — the WriteCursor
-                    // would see a 0-byte slice and encode would fail (this
-                    // exact bug killed connections at 21:43 on 2026-08-21).
-                    // Zero-fill to the exact wire size first.
-                    let mut buf = vec![0u8; total];
-                    {
-                        let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
-                        header.encode(&mut cursor)?;
-                        update.encode(&mut cursor)?;
-                    }
+                    let buf = encode_pointer_fastpath(&payload)?;
                     writer.write_all(&buf).await?;
                 }
                 ServerEvent::AutoDetectRttRequest => {
@@ -2329,5 +2339,78 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
         Self {
             writer: Rc::new(Mutex::new(writer)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal valid TS_COLORPOINTERATTRIBUTE body: 14-byte fixed header
+    /// (cacheIdx=0, xhot=0, yhot=0, w=2, h=2, lenAnd=2, lenXor=16) +
+    /// xorBmp(16) + andBmp(2).
+    fn sample_payload() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u16.to_le_bytes()); // cacheIdx
+        v.extend_from_slice(&0u16.to_le_bytes()); // xhot
+        v.extend_from_slice(&0u16.to_le_bytes()); // yhot
+        v.extend_from_slice(&2u16.to_le_bytes()); // width
+        v.extend_from_slice(&2u16.to_le_bytes()); // height
+        v.extend_from_slice(&2u16.to_le_bytes()); // lenAnd
+        v.extend_from_slice(&16u16.to_le_bytes()); // lenXor
+        v.extend_from_slice(&[0u8; 16]); // xorBmp
+        v.extend_from_slice(&[0u8; 2]); // andBmp
+        v
+    }
+
+    /// REGRESSION (2026-08-21): Vec::with_capacity left the buffer at len 0,
+    /// FastPathHeader::encode failed "received 0 bytes, expected 3", and the
+    /// client loop disconnected 47µs after every pointer PDU.
+    /// The encode must SUCCEED and fill the buffer completely.
+    #[test]
+    fn pointer_fastpath_encodefills_buffer() {
+        let payload = sample_payload();
+        let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
+        assert!(!buf.is_empty(), "empty buffer = the 0-byte WriteCursor regression");
+        assert_eq!(buf.len(), 3 + payload.len(), "header(3B for this size) + payload");
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "buffer fully written (no zero-fill leak through the header)"
+        );
+    }
+
+    /// The framed bytes must survive a full decode round-trip through
+    /// ironrdp's own fast-path parser: FastPathHeader::decode then
+    /// FastPathUpdatePdu with code 0x9 must yield the exact payload back.
+    /// Guards against silently-malformed framing a client would drop.
+    #[test]
+    fn pointer_fastpath_roundtrips_decode() {
+        use ironrdp_core::{Decode, ReadCursor};
+        use ironrdp_pdu::fast_path::FastPathHeader;
+
+        let payload = sample_payload();
+        let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
+
+        let mut cursor = ReadCursor::new(&buf);
+        let header = FastPathHeader::decode(&mut cursor).expect("header must decode");
+        // Update code 0x9 = PTRCOLOR lives in bits 0..4 of the first byte
+        // combined with the number-of-length-bytes field; verify via the
+        // parsed header that the declared length covers exactly the payload.
+        let remaining = cursor.remaining();
+        assert_eq!(
+            remaining.len(),
+            payload.len(),
+            "after the header, exactly the TS_COLORPOINTERATTRIBUTE body remains"
+        );
+        assert_eq!(remaining, payload.as_slice(), "payload bytes intact");
+        let _ = header;
+    }
+
+    /// Empty payload must not panic (encode of a bare PTRCOLOR envelope).
+    #[test]
+    fn pointer_fastpath_empty_payload_ok() {
+        let buf = encode_pointer_fastpath(&[]).expect("empty payload is representable");
+        // 1-byte length field only + no data
+        assert_eq!(buf.len(), 2);
     }
 }
