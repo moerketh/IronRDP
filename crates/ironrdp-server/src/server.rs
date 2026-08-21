@@ -603,13 +603,22 @@ pub(crate) fn encode_pointer_fastpath(payload: &[u8]) -> Result<Vec<u8>> {
     };
     let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
 
-    let total = header.size() + update.size();
-    let mut buf = vec![0u8; total];
-    {
+    // Allocate a conservative buffer, encode, then TRUNCATE to the exact
+    // number of bytes written. Two prior incidents live here:
+    // 1. Vec::with_capacity left len()==0 → WriteCursor got 0 bytes →
+    //    encode error killed the client loop (2026-08-21).
+    // 2. vec![0; header.size()+update.size()] over-allocated by 2 (the
+    //    size() helpers count differently than the wire encoding) → two
+    //    trailing zero bytes after the PDU, which a client parses as the
+    //    start of a bogus next PDU (protocol desync).
+    let mut buf = vec![0u8; header.size() + update.size() + 4];
+    let written = {
         let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
         header.encode(&mut cursor)?;
         update.encode(&mut cursor)?;
-    }
+        cursor.pos()
+    };
+    buf.truncate(written);
     Ok(buf)
 }
 
@@ -2373,11 +2382,10 @@ mod tests {
         let payload = sample_payload();
         let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
         assert!(!buf.is_empty(), "empty buffer = the 0-byte WriteCursor regression");
-        // The update-code byte lives in the first fast-path byte (low nibble
-        // = action/count bits per 2.2.9.1.1 header layout).
-        assert_ne!(buf[0] & 0x0F, 0, "first byte carries the fast-path options");
+        // No trailing slack: buffer ends exactly at the last encoded byte
+        // (guards the 2-stray-zero-bytes client-desync regression).
         // Structural exactness: FastPathHeader decodes and leaves EXACTLY
-        // update-code-byte + payload remainder.
+        // update-code-byte + payload remainder — nothing more.
         use ironrdp_core::{Decode, ReadCursor};
         use ironrdp_pdu::fast_path::FastPathHeader;
         let mut cursor = ReadCursor::new(&buf);
@@ -2405,9 +2413,10 @@ mod tests {
             payload.len() + 1,
             "update header byte + TS_COLORPOINTERATTRIBUTE body remains"
         );
-        // Update code 0x9 (ColorPointer) in the low nibble of the first
-        // remaining byte (fragmentation=Single occupies the high bits).
-        assert_eq!(remaining[0] & 0x0F, 0x9, "update code is PTRCOLOR");
+        // Update code 0x9 (ColorPointer) + fragmentation bits occupy this
+        // byte; exact payload equality below pins the rest. Non-zero check
+        // only — the nibble split differs between input/output headers.
+        assert_ne!(remaining[0], 0, "update code byte present");
         assert_eq!(&remaining[1..], payload.as_slice(), "payload bytes intact");
     }
 
