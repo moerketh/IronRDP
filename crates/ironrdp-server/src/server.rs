@@ -583,6 +583,13 @@ pub enum ServerEvent {
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(feature = "egfx")]
     Egfx(EgfxServerMessage),
+    /// Send a pointer shape/visibility update to the client as a
+    /// fast-path output PDU ([MS-RDPBCGR] 2.2.9.1.1.4).
+    /// The bytes are a fully-encoded TS_FP_POINTERPOINTERATTRIBUTE-style
+    /// update payload produced by the embedding server (lamco), i.e. the
+    /// FastPathUpdate::Pointer body — NOT including the fast-path update
+    /// header byte, which this crate adds.
+    Pointer(Vec<u8>),
     /// Trigger an RTT measurement probe (requires auto-detect enabled).
     AutoDetectRttRequest,
 }
@@ -1532,6 +1539,35 @@ impl RdpServer {
                         writer.write_all(&data).await?;
                     }
                 },
+                ServerEvent::Pointer(payload) => {
+                    // Fast-path output update ([MS-RDPBCGR] 2.2.9.1.1),
+                    // framed exactly like UpdateFragmenter::encode_fastpath:
+                    // FastPathHeader(no encryption — Enhanced Session relay
+                    // skips RDP-level crypto) + FastPathUpdatePdu with
+                    // update code 0x9 (PTRCOLOR). `payload` is the encoded
+                    // TS_COLORPOINTERATTRIBUTE body.
+                    use ironrdp_core::Encode as _;
+                    use ironrdp_pdu::fast_path::{
+                        EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
+                    };
+
+                    let update = FastPathUpdatePdu {
+                        fragmentation: Fragmentation::Single,
+                        update_code: UpdateCode::ColorPointer,
+                        compression_flags: None,
+                        compression_type: None,
+                        data: &payload,
+                    };
+                    let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
+
+                    let mut buf = Vec::with_capacity(header.size() + update.size());
+                    {
+                        let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
+                        header.encode(&mut cursor)?;
+                        update.encode(&mut cursor)?;
+                    }
+                    writer.write_all(&buf).await?;
+                }
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
