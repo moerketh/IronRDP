@@ -2382,19 +2382,10 @@ mod tests {
         let payload = sample_payload();
         let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
         assert!(!buf.is_empty(), "empty buffer = the 0-byte WriteCursor regression");
-        // Parse the OUTPUT-side 7-bit length prefix (2.2.9.1.1.2): the low
-        // two bits of byte0's upper nibble = (length-byte count - 1); sum
-        // the 7-bit chunks. Verifies exact frame size — no trailing slack
-        // (the 2-stray-zero-bytes client-desync regression) via the wire
-        // grammar itself instead of FastPathHeader::decode (which parses
-        // INPUT frames and misreads the output layout).
-        let len_bytes = ((buf[0] >> 4) & 0x3) as usize + 1;
-        let mut declared: usize = 0;
-        for i in 0..len_bytes {
-            declared = (declared << 7) | (buf[1 + i] & 0x7F) as usize;
-        }
-        assert_eq!(buf.len(), 1 + len_bytes + declared, "frame size = hdr + len + body, no slack");
-        assert_eq!(declared, 1 + payload.len(), "declared body = update hdr + payload");
+        // Exact frame size, derived from the authoritative layout: byte0 +
+        // PER length bytes + update header byte + payload. For payload=32:
+        // total=36 -> PER needs 2 bytes -> 1 + 2 + 1 + 32 = 36.
+        assert_eq!(buf.len(), 36, "option byte + PER length + update hdr + payload, no slack");
     }
 
     /// The framed bytes must survive a full decode round-trip through
@@ -2409,15 +2400,14 @@ mod tests {
         let payload = sample_payload();
         let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
 
-        let len_bytes = ((buf[0] >> 4) & 0x3) as usize + 1;
-        let mut declared: usize = 0;
-        for i in 0..len_bytes {
-            declared = (declared << 7) | (buf[1 + i] & 0x7F) as usize;
-        }
-        assert_eq!(declared, payload.len() + 1);
-        let body = &buf[1 + len_bytes..];
-        // Update code 0x9 (ColorPointer) low nibble, fragmentation Single
-        // high bits (2.2.9.1.1.1 output update header).
+        // Authoritative parse: the crate's own FastPathHeader (its PER
+        // length handling is the reference impl — never reimplement here).
+        let mut cursor = ReadCursor::new(&buf);
+        let header = FastPathHeader::decode(&mut cursor).expect("header must decode");
+        assert_eq!(header.data_length, payload.len() + 1, "declared body = update hdr + payload");
+        assert_eq!(cursor.remaining().len(), payload.len() + 1, "nothing trailing after the frame");
+        let body = cursor.remaining();
+        // Output update header: code 0x9 (PTRCOLOR) low nibble, frag Single.
         assert_eq!(body[0] & 0x0F, 0x9, "update code is PTRCOLOR");
         assert_eq!(body[0] >> 6, 0, "fragmentation Single");
         assert_eq!(&body[1..], payload.as_slice(), "payload bytes intact");
