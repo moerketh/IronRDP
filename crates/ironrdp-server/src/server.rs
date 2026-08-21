@@ -2382,15 +2382,19 @@ mod tests {
         let payload = sample_payload();
         let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
         assert!(!buf.is_empty(), "empty buffer = the 0-byte WriteCursor regression");
-        // No trailing slack: buffer ends exactly at the last encoded byte
-        // (guards the 2-stray-zero-bytes client-desync regression).
-        // Structural exactness: FastPathHeader decodes and leaves EXACTLY
-        // update-code-byte + payload remainder — nothing more.
-        use ironrdp_core::{Decode, ReadCursor};
-        use ironrdp_pdu::fast_path::FastPathHeader;
-        let mut cursor = ReadCursor::new(&buf);
-        FastPathHeader::decode(&mut cursor).expect("framed output must re-decode");
-        assert_eq!(cursor.remaining().len(), 1 + payload.len());
+        // Parse the OUTPUT-side 7-bit length prefix (2.2.9.1.1.2): the low
+        // two bits of byte0's upper nibble = (length-byte count - 1); sum
+        // the 7-bit chunks. Verifies exact frame size — no trailing slack
+        // (the 2-stray-zero-bytes client-desync regression) via the wire
+        // grammar itself instead of FastPathHeader::decode (which parses
+        // INPUT frames and misreads the output layout).
+        let len_bytes = ((buf[0] >> 4) & 0x3) as usize + 1;
+        let mut declared: usize = 0;
+        for i in 0..len_bytes {
+            declared = (declared << 7) | (buf[1 + i] & 0x7F) as usize;
+        }
+        assert_eq!(buf.len(), 1 + len_bytes + declared, "frame size = hdr + len + body, no slack");
+        assert_eq!(declared, 1 + payload.len(), "declared body = update hdr + payload");
     }
 
     /// The framed bytes must survive a full decode round-trip through
@@ -2405,19 +2409,18 @@ mod tests {
         let payload = sample_payload();
         let buf = encode_pointer_fastpath(&payload).expect("encode must succeed");
 
-        let mut cursor = ReadCursor::new(&buf);
-        FastPathHeader::decode(&mut cursor).expect("header must decode");
-        let remaining = cursor.remaining();
-        assert_eq!(
-            remaining.len(),
-            payload.len() + 1,
-            "update header byte + TS_COLORPOINTERATTRIBUTE body remains"
-        );
-        // Update code 0x9 (ColorPointer) + fragmentation bits occupy this
-        // byte; exact payload equality below pins the rest. Non-zero check
-        // only — the nibble split differs between input/output headers.
-        assert_ne!(remaining[0], 0, "update code byte present");
-        assert_eq!(&remaining[1..], payload.as_slice(), "payload bytes intact");
+        let len_bytes = ((buf[0] >> 4) & 0x3) as usize + 1;
+        let mut declared: usize = 0;
+        for i in 0..len_bytes {
+            declared = (declared << 7) | (buf[1 + i] & 0x7F) as usize;
+        }
+        assert_eq!(declared, payload.len() + 1);
+        let body = &buf[1 + len_bytes..];
+        // Update code 0x9 (ColorPointer) low nibble, fragmentation Single
+        // high bits (2.2.9.1.1.1 output update header).
+        assert_eq!(body[0] & 0x0F, 0x9, "update code is PTRCOLOR");
+        assert_eq!(body[0] >> 6, 0, "fragmentation Single");
+        assert_eq!(&body[1..], payload.as_slice(), "payload bytes intact");
     }
 
     /// Empty payload must not panic (encode of a bare PTRCOLOR envelope).
