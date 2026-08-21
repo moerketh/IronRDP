@@ -1560,7 +1560,12 @@ impl RdpServer {
                     };
                     let header = FastPathHeader::new(EncryptionFlags::empty(), update.size());
 
-                    let mut buf = Vec::with_capacity(header.size() + update.size());
+                    let total = header.size() + update.size();
+                    // with_capacity DOES NOT lengthen the Vec — the WriteCursor
+                    // would see a 0-byte slice and encode would fail (this
+                    // exact bug killed connections at 21:43 on 2026-08-21).
+                    // Zero-fill to the exact wire size first.
+                    let mut buf = vec![0u8; total];
                     {
                         let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
                         header.encode(&mut cursor)?;
