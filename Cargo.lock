@@ -3299,6 +3299,7 @@ dependencies = [
  "ironrdp-svc",
  "ironrdp-tokio",
  "ironrdp-usb",
+ "ironrdp-vmconnect",
  "qoicoubeh",
  "rand 0.9.4",
  "rayon",

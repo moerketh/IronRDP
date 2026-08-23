@@ -518,6 +518,24 @@ pub enum TransportTls {
     /// the transport is already encrypted; see the preconditions on
     /// [`RdpServer::run_connection_with`].
     AlreadyDone,
+    /// The Hyper-V host (vmms) terminated TLS *and* authenticated the user via
+    /// CredSSP on its front-end connection with `vmconnect.exe`, and relays a
+    /// plaintext RDP stream to this guest server. IronRDP performs the X.224
+    /// exchange and then skips both the TLS upgrade and the CredSSP exchange.
+    ///
+    /// # Security
+    ///
+    /// Unlike [`AlreadyDone`], this skips *authentication* as well as
+    /// encryption: the resulting session is neither encrypted nor
+    /// authenticated by this server. Select it only for a listener whose
+    /// transport is itself the proof of identity — an AF_HYPERV/AF_VSOCK
+    /// listener that only the hosting hypervisor can reach. Selecting it for a
+    /// TCP listener reachable by untrusted peers accepts anonymous sessions.
+    ///
+    /// See [`ironrdp_vmconnect::server`] for the full description of the seam.
+    ///
+    /// [`AlreadyDone`]: Self::AlreadyDone
+    HostRelayed,
 }
 
 /// RDP Server
@@ -1408,6 +1426,20 @@ impl RdpServer {
 
         self.attach_channels(&mut acceptor);
 
+        // The Hyper-V host (vmms) terminated TLS and authenticated the user on
+        // the front-end connection, so there is no TLS record layer on this
+        // transport and no second CredSSP exchange to have. This path must run
+        // before `accept_begin`, which would tear the `Framed` apart and drop
+        // the MCS Connect Initial that vmms pipelines behind the X.224
+        // Connection Request.
+        if matches!(tls, TransportTls::HostRelayed) {
+            let framed = ironrdp_vmconnect::server::accept_begin_host_relayed(framed, &mut acceptor)
+                .await
+                .map_err_kind("host-relayed accept_begin failed", ServerErrorKind::Connector)?;
+            self.accept_finalize(framed, acceptor).await?;
+            return Ok(());
+        }
+
         let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
             .await
             .map_err_kind("accept_begin failed", ServerErrorKind::Connector)?;
@@ -1439,6 +1471,7 @@ impl RdpServer {
                     self.finalize_after_upgrade(TokioFramed::new(stream), acceptor, "TLS-offloaded stream")
                         .await?;
                 }
+                TransportTls::HostRelayed => unreachable!("returned before accept_begin"),
             },
 
             BeginResult::Continue(framed) => {
