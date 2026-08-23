@@ -57,6 +57,14 @@ impl UpdateFragmenter {
 
     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
         match self.data.len() - self.position {
+            // An empty payload is a complete update in its own right: PTR_NULL
+            // and PTR_DEFAULT ([MS-RDPBCGR] 2.2.9.1.1.4.3 and 2.2.9.1.1.4.6)
+            // carry no body at all. Emit it once, as the single fragment;
+            // reaching zero on any later call means the data is exhausted.
+            0 if self.index == 0 => self
+                .encode_fastpath(Fragmentation::Single, &[], dst)
+                .map(|written| (0, written)),
+
             0 => None,
 
             1..=MAX_FASTPATH_UPDATE_SIZE => {
@@ -135,6 +143,29 @@ mod tests {
         ));
 
         assert!(fragmenter.next(&mut buffer).is_none());
+    }
+
+    /// `UpdateCode::HiddenPointer` and `UpdateCode::DefaultPointer` have no
+    /// body. Before this was handled, `next` returned `None` on the first call
+    /// and the update was silently dropped instead of being sent.
+    #[test]
+    fn test_empty_payload_emits_one_pdu() {
+        let mut fragmenter = UpdateFragmenter::new(UpdateCode::HiddenPointer, Vec::new());
+        let mut buffer = vec![0; 100];
+        let written = fragmenter
+            .next(&mut buffer)
+            .expect("empty update must still be emitted");
+        assert!(written > 0);
+
+        let mut cursor = ReadCursor::new(&buffer);
+        let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+        assert_eq!(header.data_length, 3, "update header byte + empty 16-bit size field");
+        assert_eq!(update.update_code, UpdateCode::HiddenPointer);
+        assert_eq!(update.fragmentation, Fragmentation::Single);
+        assert!(update.data.is_empty());
+
+        assert!(fragmenter.next(&mut buffer).is_none(), "exactly one PDU");
     }
 
     #[test]
