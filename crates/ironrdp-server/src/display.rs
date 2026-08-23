@@ -51,6 +51,30 @@ impl core::fmt::Debug for RGBAPointer {
     }
 }
 
+/// A pointer (mouse cursor) update pushed outside the display update stream.
+///
+/// [`RdpServerDisplayUpdates`](crate::RdpServerDisplayUpdates) is polled by the
+/// server, so a backend that learns of a cursor change from somewhere else —
+/// a compositor seat thread, a Hyper-V Enhanced Session guest agent — cannot
+/// inject one. Sending [`ServerEvent::Pointer`](crate::ServerEvent::Pointer)
+/// does that instead. The variants mirror the pointer subset of
+/// [`DisplayUpdate`] and are encoded by the same code path.
+#[derive(Debug, Clone)]
+pub enum PointerUpdate {
+    /// Move the pointer without changing its shape ([MS-RDPBCGR] 2.2.9.1.1.4.2).
+    Position(PointerPositionAttribute),
+    /// 24bpp pointer with an AND/XOR mask ([MS-RDPBCGR] 2.2.9.1.1.4.4).
+    Color(ColorPointer),
+    /// 32bpp pointer with an alpha channel ([MS-RDPBCGR] 2.2.9.1.1.4.5).
+    Rgba(RGBAPointer),
+    /// Hide the pointer ([MS-RDPBCGR] 2.2.9.1.1.4.3).
+    Hide,
+    /// Restore the client's default pointer ([MS-RDPBCGR] 2.2.9.1.1.4.6).
+    Default,
+    /// Select a previously cached pointer ([MS-RDPBCGR] 2.2.9.1.1.4.7).
+    Cached(u16),
+}
+
 #[derive(Debug, Clone)]
 pub struct ColorPointer {
     pub cache_index: u16,

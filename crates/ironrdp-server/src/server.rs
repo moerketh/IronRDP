@@ -52,7 +52,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::autodetect::{AutoDetectManager, AutoDetectOutcome, RttSnapshot};
 use crate::clipboard::CliprdrServerFactory;
-use crate::display::{DisplayUpdate, RdpServerDisplay};
+use crate::display::{DisplayUpdate, PointerUpdate, RdpServerDisplay};
 use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResult};
@@ -717,6 +717,8 @@ impl ErrorInfoDisconnectHandle {
     }
 }
 
+// NOTE: no #[derive(Debug)] — the manual impl below avoids dumping
+// pointer-frame payload bytes (and other large payloads) into logs.
 pub enum ServerEvent {
     Quit(String),
     /// Disconnect the active client with a `ServerSetErrorInfoPdu` carrying
@@ -732,6 +734,12 @@ pub enum ServerEvent {
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(feature = "egfx")]
     Egfx(EgfxServerMessage),
+    /// Send a pointer shape or position update to the client as a fast-path
+    /// output PDU ([MS-RDPBCGR] 2.2.9.1.1.4).
+    ///
+    /// For backends that learn of cursor changes outside the
+    /// [`RdpServerDisplayUpdates`](crate::RdpServerDisplayUpdates) poll loop.
+    Pointer(PointerUpdate),
     /// Trigger an RTT measurement probe (requires auto-detect enabled).
     AutoDetectRttRequest,
     #[cfg(feature = "usb")]
@@ -764,6 +772,7 @@ impl fmt::Debug for ServerEvent {
             Self::Egfx(..) => f.write_str("Egfx(..)"),
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
+            Self::Pointer(..) => f.write_str("Pointer(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
         }
     }
@@ -2158,6 +2167,16 @@ impl RdpServer {
                             .map_err(|e| ServerError::io("write_all", e))?;
                     }
                 },
+                ServerEvent::Pointer(update) => {
+                    let mut fragmenter = UpdateEncoder::pointer_update(update)?;
+                    let mut buf = vec![0u8; fragmenter.size_hint()];
+                    while let Some(len) = fragmenter.next(&mut buf) {
+                        writer
+                            .write_all(&buf[..len])
+                            .await
+                            .map_err(|e| ServerError::io("send pointer update", e))?;
+                    }
+                }
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
@@ -3004,11 +3023,14 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_core::impl_as_any;
+    use ironrdp_core::{ReadCursor, decode_cursor, impl_as_any};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
     use ironrdp_pdu::gcc::ChannelName;
+    use ironrdp_pdu::pointer::PointerPositionAttribute;
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
 
     use super::*;
+    use crate::display::ColorPointer;
 
     /// A channel backend that owns a resource, released on drop the way
     /// `RdpsndServer` stops its handler.
@@ -3057,5 +3079,118 @@ mod tests {
             released.load(Ordering::Relaxed),
             "the channel backends of a finished connection must be released, not held until the next client"
         );
+    }
+
+    /// Drive a [`PointerUpdate`] through the same encoder the event loop uses and
+    /// return the framed fast-path bytes.
+    fn encode(update: PointerUpdate) -> Vec<u8> {
+        let mut fragmenter = UpdateEncoder::pointer_update(update).expect("encode must succeed");
+        let mut buf = vec![0u8; fragmenter.size_hint()];
+        let mut out = Vec::new();
+        while let Some(len) = fragmenter.next(&mut buf) {
+            out.extend_from_slice(&buf[..len]);
+        }
+        out
+    }
+
+    /// Split a stream of fast-path output PDUs into `(update_code, fragmentation)`
+    /// pairs using the crate's own decoders.
+    ///
+    /// Both the PER length arithmetic in `FastPathHeader` and the bit packing of
+    /// the update header are easy to reimplement subtly wrong — bits 4..6 carry
+    /// fragmentation and bits 6..8 carry compression — so decode rather than
+    /// hand-roll.
+    fn parse_frames(buf: &[u8]) -> Vec<(UpdateCode, Fragmentation)> {
+        let mut cursor = ReadCursor::new(buf);
+        let mut frames = Vec::new();
+        while !cursor.is_empty() {
+            let _header: FastPathHeader = decode_cursor(&mut cursor).expect("header must decode");
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).expect("update must decode");
+            frames.push((update.update_code, update.fragmentation));
+        }
+        frames
+    }
+
+    /// 2x2 colour pointer whose XOR mask is `xor_len` bytes.
+    ///
+    /// [MS-RDPBCGR] 2.2.9.1.1.4.4 requires each mask scanline to be padded to a
+    /// 16-bit boundary, which `ColorPointerAttribute::encode` enforces: both mask
+    /// lengths must divide by the height into an even number of bytes per row.
+    fn sample_color_pointer(xor_len: usize) -> PointerUpdate {
+        assert_eq!(xor_len % 4, 0, "xor mask must stay scanline-aligned for height 2");
+        PointerUpdate::Color(ColorPointer {
+            cache_index: 0,
+            width: 2,
+            height: 2,
+            hot_x: 0,
+            hot_y: 0,
+            and_mask: vec![0; 4],
+            xor_mask: vec![0xab; xor_len],
+        })
+    }
+
+    /// A pointer event must produce exactly one well-formed fast-path PDU with no
+    /// trailing slack.
+    ///
+    /// Two regressions live here. A hand-rolled encoder first used
+    /// `Vec::with_capacity`, leaving `len() == 0`, so `WriteCursor` got an empty
+    /// slice and every pointer send killed the session. The fix then
+    /// over-allocated, leaving two zero bytes after the PDU that a client reads
+    /// as the start of a bogus next PDU. Going through `UpdateFragmenter` makes
+    /// both unrepresentable; this test pins that.
+    #[test]
+    fn pointer_event_frames_exactly_one_pdu() {
+        let buf = encode(sample_color_pointer(16));
+        assert!(!buf.is_empty(), "empty buffer = the 0-byte WriteCursor regression");
+        assert_eq!(
+            parse_frames(&buf),
+            vec![(UpdateCode::ColorPointer, Fragmentation::Single)],
+            "exactly one PDU, no trailing slack a client would read as a bogus next PDU"
+        );
+    }
+
+    /// Every variant must carry its own update code. The previous API took raw
+    /// bytes and hardcoded PTRCOLOR, so a hide or position update went out
+    /// mislabeled as a colour pointer.
+    #[test]
+    fn pointer_event_uses_the_update_code_for_its_variant() {
+        let cases = [
+            (sample_color_pointer(16), UpdateCode::ColorPointer),
+            (PointerUpdate::Hide, UpdateCode::HiddenPointer),
+            (PointerUpdate::Default, UpdateCode::DefaultPointer),
+            (PointerUpdate::Cached(7), UpdateCode::CachedPointer),
+            (
+                PointerUpdate::Position(PointerPositionAttribute { x: 1, y: 2 }),
+                UpdateCode::PositionPointer,
+            ),
+        ];
+
+        for (update, expected) in cases {
+            let buf = encode(update);
+            assert_eq!(
+                parse_frames(&buf),
+                vec![(expected, Fragmentation::Single)],
+                "wrong framing for {expected:?}"
+            );
+        }
+    }
+
+    /// Payloads over `MAX_FASTPATH_UPDATE_SIZE` must fragment rather than emit one
+    /// over-long PDU. The hand-rolled encoder had no fragmentation at all.
+    #[test]
+    fn pointer_event_fragments_oversized_payload() {
+        // 20_000 bytes of xor mask puts the encoded pointer past the 16_374-byte
+        // single-update ceiling.
+        let buf = encode(sample_color_pointer(20_000));
+
+        let frames = parse_frames(&buf);
+
+        assert!(frames.len() > 1, "oversized payload must span multiple PDUs");
+        assert!(
+            frames.iter().all(|(code, _)| *code == UpdateCode::ColorPointer),
+            "every fragment carries the update code"
+        );
+        assert_eq!(frames[0].1, Fragmentation::First);
+        assert_eq!(frames.last().expect("at least one fragment").1, Fragmentation::Last);
     }
 }

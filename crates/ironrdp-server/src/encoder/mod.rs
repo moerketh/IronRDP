@@ -19,7 +19,7 @@ use self::rfx::RfxEncoder;
 use super::BitmapUpdate;
 use crate::error::{ServerError, ServerErrorExt as _, ServerResult, ServerResultExt as _};
 use crate::macros::time_warn;
-use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
+use crate::{ColorPointer, DisplayUpdate, Framebuffer, PointerUpdate, RGBAPointer};
 
 mod bitmap;
 mod fast_path;
@@ -203,6 +203,23 @@ impl UpdateEncoder {
             .as_mut()
             .expect("bitmap updater always Some")
             .set_desktop_size(size);
+    }
+
+    /// Encode an out-of-band pointer update pushed via
+    /// [`ServerEvent::Pointer`](crate::ServerEvent::Pointer).
+    ///
+    /// Shares the per-variant encoders with the display update stream, so both
+    /// paths produce identical wire bytes and both get fast-path fragmentation
+    /// for pointers larger than a single update PDU.
+    pub(crate) fn pointer_update(update: PointerUpdate) -> ServerResult<UpdateFragmenter> {
+        match update {
+            PointerUpdate::Position(pos) => Self::pointer_position(pos),
+            PointerUpdate::Color(ptr) => Self::color_pointer(ptr),
+            PointerUpdate::Rgba(ptr) => Self::rgba_pointer(ptr),
+            PointerUpdate::Hide => Self::hide_pointer(),
+            PointerUpdate::Default => Self::default_pointer(),
+            PointerUpdate::Cached(cache_index) => Self::cached_pointer(cache_index),
+        }
     }
 
     fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
