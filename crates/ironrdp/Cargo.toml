@@ -51,6 +51,9 @@ client-vmconnect = ["ironrdp-client?/vmconnect"]
 client-location = ["ironrdp-client?/location"]
 client-all = ["ironrdp-client?/all"]
 vmconnect = ["dep:ironrdp-vmconnect"]
+# Guest-side Enhanced Session backend, forwarded so consumers can opt in
+# without naming `ironrdp-vmconnect`.
+vmconnect-server = ["vmconnect", "ironrdp-vmconnect?/server"]
 qoi = ["ironrdp-server?/qoi", "ironrdp-pdu?/qoi", "ironrdp-connector?/qoi", "ironrdp-session?/qoi", "ironrdp-client?/qoi"]
 qoiz = ["ironrdp-server?/qoiz", "ironrdp-pdu?/qoiz", "ironrdp-connector?/qoiz", "ironrdp-session?/qoiz", "ironrdp-client?/qoiz"]
 

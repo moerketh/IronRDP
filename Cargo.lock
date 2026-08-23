@@ -3503,12 +3503,15 @@ dependencies = [
 name = "ironrdp-vmconnect"
 version = "0.1.0"
 dependencies = [
+ "ironrdp-acceptor",
  "ironrdp-async",
  "ironrdp-connector",
  "ironrdp-core 0.2.1",
  "ironrdp-dvc",
  "ironrdp-pdu",
+ "ironrdp-tokio",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "windows",
  "windows-registry",

@@ -38,6 +38,8 @@ mod native_credssp;
 pub fn __test_binding_hash(magic: &[u8], nonce: &[u8; 32], public_key: &[u8]) -> Vec<u8> {
     native_credssp::binding_hash(magic, nonce, public_key)
 }
+#[cfg(feature = "server")]
+pub mod server;
 
 /// TCP port a Hyper-V VM console listens on.
 pub const PORT: u16 = 2179;

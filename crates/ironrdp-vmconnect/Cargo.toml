@@ -14,14 +14,19 @@ categories.workspace = true
 
 [lib]
 doctest = false
-test = false
 
 [features]
+default = []
+# Guest-side Enhanced Session backend (the `server` module). The client-side
+# front-end needs no server machinery, so ironrdp-acceptor stays optional.
+server = ["dep:ironrdp-acceptor"]
+
 # Internal (PRIVATE!) feature used to expose native CredSSP helpers to the shared integration tests.
 # Don't rely on this whatsoever. It may disappear at any time.
 __test = []
 
 [dependencies]
+ironrdp-acceptor = { path = "../ironrdp-acceptor", version = "0.10", optional = true } # public
 ironrdp-async = { path = "../ironrdp-async", version = "0.10" } # public
 ironrdp-connector = { path = "../ironrdp-connector", version = "0.10" } # public
 ironrdp-core = { path = "../ironrdp-core", version = "0.2", features = ["alloc"] } # public
@@ -42,6 +47,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 windows-registry = "0.6"
+[dev-dependencies]
+ironrdp-tokio = { path = "../ironrdp-tokio", version = "0.10" }
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true
