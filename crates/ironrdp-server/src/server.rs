@@ -2454,7 +2454,16 @@ impl RdpServer {
                     }
                 }
             } else {
-                debug!("Skipping credential validation (no credentials in AcceptorResult)");
+                // Only reachable with a validator configured, so this is never
+                // routine: the operator asked for credential validation and it
+                // did not run. Happens when the negotiated protocol is HYBRID or
+                // HYBRID_EX, where the acceptor does not surface Client Info
+                // credentials because CredSSP is meant to have authenticated
+                // already — including on `TransportTls::HostRelayed`, where it
+                // did not, because vmms sends empty credentials.
+                warn!(
+                    "Credential validator configured but no credentials were received;                      this connection was NOT authenticated"
+                );
             }
         }
 
