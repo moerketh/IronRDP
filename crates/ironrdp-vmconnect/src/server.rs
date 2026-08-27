@@ -28,9 +28,10 @@ use core::time::Duration;
 
 use ironrdp_acceptor::Acceptor;
 use ironrdp_async::{Framed, FramedRead, FramedWrite, single_sequence_step};
-use ironrdp_connector::ConnectorResult;
+use ironrdp_connector::{ConnectorResult, general_err, reason_err};
 use ironrdp_core::WriteBuf;
-use tracing::{debug, instrument};
+use ironrdp_pdu::nego::SecurityProtocol;
+use tracing::{instrument, warn};
 
 /// Upper bound for completing the X.224 exchange on a host-relayed connection.
 ///
@@ -48,6 +49,35 @@ use tracing::{debug, instrument};
 /// Ten seconds mirrors [`PCB_TRANSMIT_DEADLINE`](crate::PCB_TRANSMIT_DEADLINE),
 /// the equivalent bound MS-RDPEPS places on the client's preconnection PDU.
 pub const HOST_RELAY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Require a negotiated protocol whose security upgrade this path may skip.
+///
+/// The Connection Confirm has just promised the peer a particular protocol, and
+/// [`accept_begin_host_relayed`] then declines to perform it. That is only
+/// coherent when the peer is not going to start one either:
+///
+/// - `HYBRID` / `HYBRID_EX` — what vmms negotiates. CredSSP already happened on
+///   the host's front-end connection with `vmconnect.exe`, so the relayed stream
+///   carries none of it.
+/// - empty — the server advertised no enhanced security, so nothing follows.
+///
+/// `SSL` means the peer expects TLS records immediately after the Confirm.
+/// Skipping the handshake desynchronises the stream, and the failure surfaces
+/// much later as an unintelligible decode error somewhere in MCS. Refusing here
+/// turns a confusing mid-sequence failure into a clear configuration error.
+///
+/// This is the server-side counterpart of
+/// [`ensure_selected_credssp`](crate::ensure_selected_credssp).
+pub fn ensure_host_relayable(protocol: SecurityProtocol) -> ConnectorResult<()> {
+    if protocol.is_empty() || protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+        Ok(())
+    } else {
+        Err(reason_err!(
+            "vmconnect",
+            "host-relayed transport cannot skip the {protocol} upgrade promised by the Connection              Confirm; a Hyper-V Enhanced Session negotiates HYBRID or HYBRID_EX",
+        ))
+    }
+}
 
 /// Run the X.224 exchange for a host-relayed Enhanced Session connection, then skip
 /// the security upgrade the acceptor would otherwise expect.
@@ -80,8 +110,20 @@ where
     let mut buf = WriteBuf::new();
 
     loop {
-        if let Some(protocol) = acceptor.reached_security_upgrade() {
-            debug!(?protocol, "Host-relayed transport: skipping TLS upgrade and CredSSP");
+        if acceptor.reached_security_upgrade().is_some() {
+            // Deliberately not `reached_security_upgrade`'s return value: that is
+            // the protocol set the server was *configured* with, not the single
+            // protocol negotiated in the Connection Confirm.
+            let protocol = acceptor
+                .negotiated_protocol()
+                .ok_or_else(|| general_err!("no negotiated protocol at the security upgrade"))?;
+
+            ensure_host_relayable(protocol)?;
+
+            warn!(
+                ?protocol,
+                "Host-relayed transport: skipping TLS and CredSSP. This connection is                  NOT authenticated and NOT encrypted by this server; the vsock peer                  allowlist is the only access control."
+            );
 
             acceptor.mark_security_upgrade_as_done();
 
@@ -103,7 +145,7 @@ where
 mod tests {
     use ironrdp_connector::DesktopSize;
     use ironrdp_core::encode_vec;
-    use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest, RequestFlags, SecurityProtocol};
+    use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest, RequestFlags};
     use ironrdp_pdu::x224::X224;
     use ironrdp_tokio::TokioFramed;
 
@@ -170,6 +212,58 @@ mod tests {
     async fn keeps_bytes_pipelined_behind_the_connection_request() {
         let (_acceptor, leftover, _reply) = handshake(SecurityProtocol::HYBRID, SecurityProtocol::HYBRID).await;
         assert_eq!(leftover, PIPELINED, "pipelined PDU must survive into accept_finalize");
+    }
+
+    /// What vmms actually negotiates, plus the no-enhanced-security case, must
+    /// pass: nothing follows the Connection Confirm on the wire in either.
+    #[test]
+    fn host_relayable_accepts_what_vmms_negotiates() {
+        for ok in [
+            SecurityProtocol::HYBRID,
+            SecurityProtocol::HYBRID_EX,
+            SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+            SecurityProtocol::empty(),
+        ] {
+            assert!(ensure_host_relayable(ok).is_ok(), "{ok} should be relayable");
+        }
+    }
+
+    /// A protocol whose handshake the peer will actually start cannot be skipped.
+    #[test]
+    fn host_relayable_refuses_protocols_that_expect_a_handshake() {
+        for bad in [SecurityProtocol::SSL, SecurityProtocol::RDSTLS] {
+            assert!(
+                ensure_host_relayable(bad).is_err(),
+                "{bad} promises a handshake this path does not perform"
+            );
+        }
+    }
+
+    /// End to end: a TLS-only server reached over the host-relayed path fails with
+    /// a clear error at the Connection Confirm, rather than skipping a handshake
+    /// the peer is about to start and desynchronising somewhere inside MCS.
+    #[tokio::test]
+    async fn tls_only_server_is_refused_on_the_host_relayed_path() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(&connection_request(SecurityProtocol::SSL))
+            .await
+            .expect("client write");
+
+        let mut acceptor = acceptor(SecurityProtocol::SSL);
+        // `Framed` is not Debug, so `expect_err` is unavailable here.
+        let err = match accept_begin_host_relayed(TokioFramed::new(server), &mut acceptor).await {
+            Ok(_) => panic!("SSL must not be silently skipped"),
+            Err(e) => e,
+        };
+
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("HYBRID") || rendered.contains("host-relayed"),
+            "error should explain the mismatch, got: {rendered}"
+        );
     }
 
     /// REGRESSION (measured 2026-08-27): a peer that connects and sends nothing

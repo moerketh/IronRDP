@@ -293,6 +293,29 @@ impl Acceptor {
         self.static_channels.insert_dynamic(channel).is_some()
     }
 
+    /// The security protocol this acceptor selected in its Connection Confirm,
+    /// once the X.224 exchange has produced one.
+    ///
+    /// Distinct from [`Self::reached_security_upgrade`], which reports the
+    /// protocol set the server was *configured* with rather than the single
+    /// protocol actually negotiated. Callers deciding what to do about the
+    /// upgrade — perform it, or deliberately skip it — need this one.
+    ///
+    /// `None` before the Connection Confirm is sent and after the sequence has
+    /// been consumed.
+    pub fn negotiated_protocol(&self) -> Option<SecurityProtocol> {
+        match self.state {
+            AcceptorState::SecurityUpgrade { protocol, .. }
+            | AcceptorState::Credssp { protocol, .. }
+            | AcceptorState::BasicSettingsWaitInitial { protocol, .. }
+            | AcceptorState::BasicSettingsSendResponse { protocol, .. }
+            | AcceptorState::ChannelConnection { protocol, .. }
+            | AcceptorState::RdpSecurityCommencement { protocol, .. }
+            | AcceptorState::SecureSettingsExchange { protocol, .. } => Some(protocol),
+            _ => None,
+        }
+    }
+
     pub fn reached_security_upgrade(&self) -> Option<SecurityProtocol> {
         match self.state {
             AcceptorState::SecurityUpgrade { .. } => Some(self.security),
