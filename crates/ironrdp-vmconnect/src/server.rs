@@ -24,11 +24,30 @@
 //! a listener that untrusted peers can reach through this function accepts anonymous,
 //! unencrypted RDP sessions.
 
+use core::time::Duration;
+
 use ironrdp_acceptor::Acceptor;
 use ironrdp_async::{Framed, FramedRead, FramedWrite, single_sequence_step};
 use ironrdp_connector::ConnectorResult;
 use ironrdp_core::WriteBuf;
 use tracing::{debug, instrument};
+
+/// Upper bound for completing the X.224 exchange on a host-relayed connection.
+///
+/// [`accept_begin_host_relayed`] blocks on the peer's Connection Request. A peer
+/// that connects and then sends nothing would otherwise park that read forever —
+/// and because an [`Acceptor`] is driven with `&mut`, a server handling one
+/// connection at a time is wedged for as long as the silent peer holds the
+/// socket open. Measured on a Hyper-V guest 2026-08-27: a single blank
+/// connection blocked the listener for 13.5 minutes, leaving real vmms
+/// connections un-accepted in the backlog.
+///
+/// This crate stays runtime-agnostic; async callers should enforce the deadline
+/// around [`accept_begin_host_relayed`] (for example with `tokio::time::timeout`).
+///
+/// Ten seconds mirrors [`PCB_TRANSMIT_DEADLINE`](crate::PCB_TRANSMIT_DEADLINE),
+/// the equivalent bound MS-RDPEPS places on the client's preconnection PDU.
+pub const HOST_RELAY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Run the X.224 exchange for a host-relayed Enhanced Session connection, then skip
 /// the security upgrade the acceptor would otherwise expect.
@@ -45,6 +64,9 @@ use tracing::{debug, instrument};
 /// `BeginResult::ShouldUpgrade(stream)` via `Framed::into_inner_no_leftover`, which
 /// discards them; the client then hangs waiting for a Connect Response that the
 /// server is waiting to be asked for.
+///
+/// Callers should bound this with [`HOST_RELAY_HANDSHAKE_DEADLINE`]; a peer that
+/// connects and sends nothing otherwise blocks the caller indefinitely.
 ///
 /// # Security
 ///
@@ -148,6 +170,34 @@ mod tests {
     async fn keeps_bytes_pipelined_behind_the_connection_request() {
         let (_acceptor, leftover, _reply) = handshake(SecurityProtocol::HYBRID, SecurityProtocol::HYBRID).await;
         assert_eq!(leftover, PIPELINED, "pipelined PDU must survive into accept_finalize");
+    }
+
+    /// REGRESSION (measured 2026-08-27): a peer that connects and sends nothing
+    /// parks this function's first read. Because an `Acceptor` is driven with
+    /// `&mut`, a server handling one connection at a time is wedged for as long
+    /// as that peer holds the socket — one blank connection blocked a live
+    /// listener for 13.5 minutes while real vmms connections sat un-accepted.
+    ///
+    /// This pins the property that makes [`HOST_RELAY_HANDSHAKE_DEADLINE`]
+    /// load-bearing: the function blocks, so the *caller* must bound it. If this
+    /// ever starts returning on its own, the constant and its docs are stale.
+    #[tokio::test]
+    async fn silent_peer_blocks_until_the_caller_gives_up() {
+        // `_client` must stay bound: dropping the near end closes the duplex, the
+        // read returns EOF, and the function would fail fast — testing nothing.
+        let (_client, server) = tokio::io::duplex(4096);
+
+        let mut acceptor = acceptor(SecurityProtocol::HYBRID);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            accept_begin_host_relayed(TokioFramed::new(server), &mut acceptor),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a silent peer must block; only the caller's deadline ends it"
+        );
     }
 
     /// After the X.224 exchange the acceptor must be past both the security upgrade

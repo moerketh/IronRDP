@@ -1433,9 +1433,27 @@ impl RdpServer {
         // the MCS Connect Initial that vmms pipelines behind the X.224
         // Connection Request.
         if matches!(tls, TransportTls::HostRelayed) {
-            let framed = ironrdp_vmconnect::server::accept_begin_host_relayed(framed, &mut acceptor)
-                .await
-                .map_err_kind("host-relayed accept_begin failed", ServerErrorKind::Connector)?;
+            // Bounded: an `Acceptor` is driven with `&mut`, so a peer that
+            // connects and never speaks would hold this server for as long as it
+            // keeps the socket open, leaving later connections un-accepted in the
+            // backlog. Only the handshake is bounded — the established session
+            // that follows is not.
+            let deadline = ironrdp_vmconnect::server::HOST_RELAY_HANDSHAKE_DEADLINE;
+            let framed = match tokio::time::timeout(
+                deadline,
+                ironrdp_vmconnect::server::accept_begin_host_relayed(framed, &mut acceptor),
+            )
+            .await
+            {
+                Ok(res) => res.map_err_kind("host-relayed accept_begin failed", ServerErrorKind::Connector)?,
+                Err(_elapsed) => {
+                    warn!(
+                        ?deadline,
+                        "Host-relayed peer did not complete the X.224 exchange in time; dropping"
+                    );
+                    return Ok(());
+                }
+            };
             self.accept_finalize(framed, acceptor).await?;
             return Ok(());
         }
