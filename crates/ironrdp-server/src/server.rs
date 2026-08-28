@@ -71,6 +71,26 @@ use ironrdp_rdpeusb::{InterfaceAlloc, io::CompletionData, server::UrbdrcControlS
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
+
+/// Upper bound for each connection-establishment step that runs before the peer
+/// has authenticated: the X.224 exchange, the TLS handshake, and CredSSP.
+///
+/// `RdpServer` drives a connection through `&mut self`, so it serves one client
+/// at a time. Without a bound, a peer that completes the TCP handshake and then
+/// sends nothing parks the first read forever and the server stops accepting
+/// anyone — no credentials and no TLS required to trigger it. Measured on a
+/// Hyper-V guest 2026-08-27 via the vsock listener: one silent connection
+/// blocked the listener for 13.5 minutes.
+///
+/// This bounds each step, not the session that follows an established
+/// connection. Note what it does and does not fix: it converts an indefinite
+/// outage from a single connection into degraded service under a *sustained*
+/// attack. Serving connections concurrently is the only thing that would fix
+/// the latter, and that is a change to `RdpServer`'s ownership model.
+///
+/// Thirty seconds is deliberately generous — this has to cover a TLS handshake
+/// and a CredSSP round trip over a slow link — while still being finite.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Monotonic milliseconds since first use, for feeding the auto-detect state machine.
@@ -1458,9 +1478,23 @@ impl RdpServer {
             return Ok(());
         }
 
-        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
-            .await
-            .map_err_kind("accept_begin failed", ServerErrorKind::Connector)?;
+        // The first read of the connection, and the cheapest to abuse: it happens
+        // before any TLS, so parking it costs a peer nothing but an open socket.
+        let res = match tokio::time::timeout(
+            HANDSHAKE_DEADLINE,
+            ironrdp_acceptor::accept_begin(framed, &mut acceptor),
+        )
+        .await
+        {
+            Ok(res) => res.map_err_kind("accept_begin failed", ServerErrorKind::Connector)?,
+            Err(_elapsed) => {
+                warn!(
+                    deadline = ?HANDSHAKE_DEADLINE,
+                    "Peer did not complete the X.224 exchange in time; dropping"
+                );
+                return Ok(());
+            }
+        };
 
         match res {
             // The only thing that varies between the two modes is who performs
@@ -1472,10 +1506,17 @@ impl RdpServer {
                         RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
-                    let accept = match tls_acceptor.accept(stream).await {
-                        Ok(accept) => accept,
-                        Err(e) => {
+                    let accept = match tokio::time::timeout(HANDSHAKE_DEADLINE, tls_acceptor.accept(stream)).await {
+                        Ok(Ok(accept)) => accept,
+                        Ok(Err(e)) => {
                             warn!("Failed to TLS accept: {}", e);
+                            return Ok(());
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                deadline = ?HANDSHAKE_DEADLINE,
+                                "Peer did not complete the TLS handshake in time; dropping"
+                            );
                             return Ok(());
                         }
                     };
@@ -1522,16 +1563,33 @@ impl RdpServer {
             // uses this value in practice.
             let client_name = "rdp-client".to_owned();
 
-            ironrdp_acceptor::accept_credssp(
-                &mut framed,
-                &mut acceptor,
-                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                client_name.into(),
-                pub_key.clone(),
-                None,
+            // Last pre-authentication step that can be parked: a peer that
+            // completes TLS and then stalls the TSRequest exchange is still
+            // unauthenticated, so it gets the same bound as the steps before it.
+            match tokio::time::timeout(
+                HANDSHAKE_DEADLINE,
+                ironrdp_acceptor::accept_credssp(
+                    &mut framed,
+                    &mut acceptor,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    client_name.into(),
+                    pub_key.clone(),
+                    None,
+                ),
             )
             .await
-            .map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+            {
+                Ok(res) => {
+                    res.map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        deadline = ?HANDSHAKE_DEADLINE,
+                        "Peer did not complete the CredSSP exchange in time; dropping"
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         let framed = self.accept_finalize(framed, acceptor).await?;
